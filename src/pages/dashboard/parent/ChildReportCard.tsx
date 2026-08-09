@@ -23,6 +23,7 @@ import {
 import { getSchoolLevelBand } from '@/lib/grading';
 import { computeBestPerSubject } from '@/lib/bestPerSubject';
 import type { BestInSubject } from '@/lib/bestPerSubject';
+import { loadSchoolBranding, resolveSchoolName } from '@/lib/schoolBranding';
 
 declare global {
   interface Window {
@@ -51,7 +52,7 @@ function loadPaystackScript(): Promise<void> {
 }
 
 export default function ParentChildReportCard() {
-  const { user } = useAuth();
+  const { user, schoolData } = useAuth();
   const [children, setChildren] = useState<any[]>([]);
   const [selectedChild, setSelectedChild] = useState<any>(null);
   const [results, setResults] = useState<any[]>([]);
@@ -108,53 +109,25 @@ export default function ParentChildReportCard() {
 
   const fetchSchoolInfo = async (schoolId: string) => {
     try {
-      const { data } = await supabaseUntyped
-        .from('schools')
-        .select('name, motto, logo_url, principal_name, principal_signature_url, address, phone, email')
-        .eq('id', schoolId)
-        .maybeSingle();
-      if (data) {
-        setSchoolInfo({
-          name: data.name?.trim() || 'School',
-          motto: data.motto || '',
-          logo_url: data.logo_url || null,
-          principal_name: data.principal_name || '',
-          address: data.address || '',
-          phone: data.phone || '',
-          email: data.email || '',
-        });
-        // Also set principal signature from school data
-        setSignatures(prev => ({
-          ...prev,
-          principal_signature_url: data.principal_signature_url || null,
-        }));
-      } else {
-        setSchoolInfo({ name: 'School' });
-      }
-    } catch (err: any) {
-      // Fallback without optional columns
-      try {
-        const { data } = await supabaseUntyped
-          .from('schools')
-          .select('name, logo_url, principal_name, address, phone, email')
-          .eq('id', schoolId)
-          .maybeSingle();
-        if (data) {
-          setSchoolInfo({
-            name: data.name?.trim() || 'School',
-            motto: '',
-            logo_url: data.logo_url || null,
-            principal_name: data.principal_name || '',
-            address: data.address || '',
-            phone: data.phone || '',
-            email: data.email || '',
-          });
-        } else {
-          setSchoolInfo({ name: 'School' });
-        }
-      } catch {
-        setSchoolInfo({ name: 'School' });
-      }
+      const fallbackName = resolveSchoolName(schoolData?.name);
+      const { data, found, error } = await loadSchoolBranding(
+        supabaseUntyped,
+        schoolId,
+        fallbackName,
+      );
+
+      if (!found) console.error('Unable to load complete school branding:', error);
+      setSchoolInfo(data);
+      setSignatures(prev => ({
+        ...prev,
+        principal_signature_url: data.principal_signature_url,
+      }));
+    } catch (err) {
+      console.error('Unable to load school branding:', err);
+      setSchoolInfo(prev => ({
+        ...prev,
+        name: resolveSchoolName(prev.name, schoolData?.name || undefined),
+      }));
     }
   };
 
@@ -364,7 +337,8 @@ export default function ParentChildReportCard() {
       await drawReportHeader(doc, schoolInfo);
       const photoUrl = selectedChild.photo_url || null;
       if (photoUrl) {
-        await addStudentPhotoToPDF(doc, photoUrl, 163, 30, 35);
+        // Top-right header portrait; 27mm is approximately 102px at 96 DPI.
+        await addStudentPhotoToPDF(doc, photoUrl, 173, 2.5, 27);
       }
       drawStudentInfo(doc, studentFullName, selectedChild.admission_number || 'N/A', classDataForGrading.name || 'N/A', term?.name || '', term?.academic_year || '', positionStr);
       const tableEndY = drawResultsTable(doc, results, classDataForGrading, 70);

@@ -24,9 +24,10 @@ import {
 import { getSchoolLevelBand } from '@/lib/grading';
 import { computeBestPerSubject } from '@/lib/bestPerSubject';
 import type { BestInSubject } from '@/lib/bestPerSubject';
+import { loadSchoolBranding, resolveSchoolName } from '@/lib/schoolBranding';
 
 export default function StudentReportCard() {
-  const { user } = useAuth();
+  const { user, schoolData } = useAuth();
   const [student, setStudent] = useState<any>(null);
   const [zoomPhoto, setZoomPhoto] = useState<string | null>(null);
   const [results, setResults] = useState<any[]>([]);
@@ -83,53 +84,25 @@ export default function StudentReportCard() {
 
   const fetchSchoolInfo = async (schoolId: string) => {
     try {
-      const { data } = await supabaseUntyped
-        .from('schools')
-        .select('name, motto, logo_url, principal_name, principal_signature_url, address, phone, email')
-        .eq('id', schoolId)
-        .maybeSingle();
-      if (data) {
-        setSchoolInfo({
-          name: data.name?.trim() || 'School',
-          motto: data.motto || '',
-          logo_url: data.logo_url || null,
-          principal_name: data.principal_name || '',
-          address: data.address || '',
-          phone: data.phone || '',
-          email: data.email || '',
-        });
-        // Also set principal signature from school data
-        setSignatures(prev => ({
-          ...prev,
-          principal_signature_url: data.principal_signature_url || null,
-        }));
-      } else {
-        setSchoolInfo({ name: 'School' });
-      }
-    } catch (err: any) {
-      // If column doesn't exist, fetch without it
-      try {
-        const { data } = await supabaseUntyped
-          .from('schools')
-          .select('name, logo_url, principal_name, address, phone, email')
-          .eq('id', schoolId)
-          .maybeSingle();
-        if (data) {
-          setSchoolInfo({
-            name: data.name?.trim() || 'School',
-            motto: '',
-            logo_url: data.logo_url || null,
-            principal_name: data.principal_name || '',
-            address: data.address || '',
-            phone: data.phone || '',
-            email: data.email || '',
-          });
-        } else {
-          setSchoolInfo({ name: 'School' });
-        }
-      } catch {
-        setSchoolInfo({ name: 'School' });
-      }
+      const fallbackName = resolveSchoolName(schoolData?.name);
+      const { data, found, error } = await loadSchoolBranding(
+        supabaseUntyped,
+        schoolId,
+        fallbackName,
+      );
+
+      if (!found) console.error('Unable to load complete school branding:', error);
+      setSchoolInfo(data);
+      setSignatures(prev => ({
+        ...prev,
+        principal_signature_url: data.principal_signature_url,
+      }));
+    } catch (err) {
+      console.error('Unable to load school branding:', err);
+      setSchoolInfo(prev => ({
+        ...prev,
+        name: resolveSchoolName(prev.name, schoolData?.name || undefined),
+      }));
     }
   };
 
@@ -304,11 +277,12 @@ export default function StudentReportCard() {
       // Header with logo
       await drawReportHeader(doc, schoolInfo);
 
-      // Student photo (top-right corner) — bigger (35x35mm ~132px)
+      // Student photo in the top-right of the header. 27mm is approximately
+      // 102px at 96 DPI, meeting the minimum size without covering term data.
       const photoUrl = student.photo_url || null;
       if (photoUrl) {
         try {
-          await addStudentPhotoToPDF(doc, photoUrl, 163, 30, 35);
+          await addStudentPhotoToPDF(doc, photoUrl, 173, 2.5, 27);
         } catch {}
       }
 

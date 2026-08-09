@@ -2,6 +2,7 @@ import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { getSchoolLevelBand, calculateCompetencyGrade, calculate844Grade, generateSubjectSpecificComment } from './grading';
 import type { SchoolLevelBand, SubjectResult } from './grading';
+import { resolveSchoolName } from './schoolBranding';
 
 // ── Shared PDF Helper Functions for Report Cards ─────────────────────────────
 
@@ -282,6 +283,104 @@ export function drawTrendGraph(
   doc.setTextColor(0, 0, 0);
 }
 
+// ── PDF Image Helpers ─────────────────────────────────────────────────────────
+
+interface RenderableImage {
+  image: HTMLImageElement;
+  cleanup: () => void;
+}
+
+function withCacheBuster(source: string): string {
+  try {
+    const url = new URL(source, window.location.href);
+    url.searchParams.set('_pdf', String(Date.now()));
+    return url.toString();
+  } catch {
+    return source;
+  }
+}
+
+function loadImageElement(source: string, timeoutMs: number = 10_000): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    const timer = window.setTimeout(() => reject(new Error('Image load timed out.')), timeoutMs);
+
+    image.crossOrigin = 'anonymous';
+    image.onload = () => {
+      window.clearTimeout(timer);
+      resolve(image);
+    };
+    image.onerror = () => {
+      window.clearTimeout(timer);
+      reject(new Error('Image could not be loaded.'));
+    };
+    image.src = source;
+  });
+}
+
+async function getRenderableImage(source: string): Promise<RenderableImage> {
+  let objectUrl: string | null = null;
+  let renderSource = source;
+
+  if (!source.startsWith('data:') && !source.startsWith('blob:')) {
+    try {
+      const response = await fetch(withCacheBuster(source), {
+        mode: 'cors',
+        cache: 'no-store',
+      });
+      if (!response.ok) throw new Error(`Image request failed (${response.status}).`);
+      const blob = await response.blob();
+      if (blob.type && !blob.type.startsWith('image/')) {
+        throw new Error('The logo URL did not return an image.');
+      }
+      objectUrl = URL.createObjectURL(blob);
+      renderSource = objectUrl;
+    } catch (error) {
+      // A direct image load is still worth trying for CDNs that permit <img>
+      // requests but reject fetch headers. Canvas security remains enforced.
+      console.warn('Image fetch failed; trying a direct image load.', error);
+    }
+  }
+
+  try {
+    const image = await loadImageElement(renderSource);
+    return {
+      image,
+      cleanup: () => {
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
+      },
+    };
+  } catch (error) {
+    if (objectUrl) {
+      URL.revokeObjectURL(objectUrl);
+      objectUrl = null;
+      // If decoding the fetched blob failed, make one final direct attempt.
+      const image = await loadImageElement(source);
+      return { image, cleanup: () => undefined };
+    }
+    throw error;
+  }
+}
+
+function rasterizeImage(image: HTMLImageElement, maxDimension: number = 2048) {
+  const naturalWidth = Math.max(1, image.naturalWidth || image.width);
+  const naturalHeight = Math.max(1, image.naturalHeight || image.height);
+  const scale = Math.min(1, maxDimension / Math.max(naturalWidth, naturalHeight));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(naturalWidth * scale));
+  canvas.height = Math.max(1, Math.round(naturalHeight * scale));
+  const context = canvas.getContext('2d');
+  if (!context) throw new Error('Canvas rendering is unavailable.');
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = 'high';
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return {
+    dataUrl: canvas.toDataURL('image/png'),
+    width: naturalWidth,
+    height: naturalHeight,
+  };
+}
+
 // ── Add Logo to PDF ──────────────────────────────────────────────────────────
 export async function addLogoToPDF(
   doc: jsPDF,
@@ -291,96 +390,27 @@ export async function addLogoToPDF(
   maxWidth: number,
   maxHeight: number
 ): Promise<boolean> {
-  if (!logoUrl) return false;
+  if (!logoUrl?.trim()) return false;
 
-  // Helper: render any image (including SVG/WebP) to PNG data URL via canvas
-  const renderToCanvas = (src: string, timeoutMs = 8000): Promise<string> =>
-    new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('Image load timeout')), timeoutMs);
-      const img = new Image();
-      img.crossOrigin = 'anonymous';
-      img.onload = () => {
-        clearTimeout(timer);
-        const canvas = document.createElement('canvas');
-        // Use 2× resolution for sharpness
-        const scale = 2;
-        canvas.width = (img.naturalWidth || maxWidth * 3.78) * scale;
-        canvas.height = (img.naturalHeight || maxHeight * 3.78) * scale;
-        const ctx = canvas.getContext('2d')!;
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        resolve(canvas.toDataURL('image/png'));
-      };
-      img.onerror = (e) => { clearTimeout(timer); reject(e); };
-      img.src = src;
-    });
-
+  let cleanup: () => void = () => undefined;
   try {
-    let dataUrl: string;
+    const renderable = await getRenderableImage(logoUrl.trim());
+    cleanup = renderable.cleanup;
+    const rasterized = rasterizeImage(renderable.image);
 
-    const getSafeUrl = (url: string) => {
-      if (url.startsWith('data:')) return url;
-      const separator = url.includes('?') ? '&' : '?';
-      return `${url}${separator}t=${Date.now()}`;
-    };
-
-    if (logoUrl.startsWith('data:')) {
-      dataUrl = await renderToCanvas(logoUrl);
-    } else {
-      // Strip existing query params for a clean fetch URL
-      const fetchUrl = logoUrl.split('?')[0];
-      let blob: Blob | null = null;
-
-      // Attempt 1: fetch with explicit CORS headers and cache-control
-      try {
-        const resp = await fetch(getSafeUrl(fetchUrl), {
-          mode: 'cors',
-          headers: {
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache',
-          },
-        });
-        if (resp.ok) blob = await resp.blob();
-      } catch { /* fall through to next attempt */ }
-
-      // Attempt 2: fetch without custom headers (some CDNs reject extra headers)
-      if (!blob) {
-        try {
-          const resp = await fetch(fetchUrl, { mode: 'cors' });
-          if (resp.ok) blob = await resp.blob();
-        } catch { /* fall through */ }
-      }
-
-      // Attempt 3: fetch without mode restriction (default browser behavior)
-      if (!blob) {
-        try {
-          const resp = await fetch(fetchUrl);
-          if (resp.ok) blob = await resp.blob();
-        } catch { /* fall through */ }
-      }
-
-      if (blob) {
-        const blobUrl = URL.createObjectURL(blob);
-        try {
-          dataUrl = await renderToCanvas(blobUrl);
-        } finally {
-          URL.revokeObjectURL(blobUrl);
-        }
-      } else {
-        // Fallback: direct img src (works if CORS headers are set on bucket)
-        console.warn('All fetch attempts failed for logo, trying direct img src:', logoUrl);
-        try {
-          dataUrl = await renderToCanvas(getSafeUrl(logoUrl));
-        } catch {
-          dataUrl = await renderToCanvas(logoUrl);
-        }
-      }
-    }
-
-    doc.addImage(dataUrl, 'PNG', x, y, maxWidth, maxHeight);
+    // Preserve the logo's aspect ratio and centre it in the allocated box.
+    const scale = Math.min(maxWidth / rasterized.width, maxHeight / rasterized.height);
+    const width = rasterized.width * scale;
+    const height = rasterized.height * scale;
+    const drawX = x + (maxWidth - width) / 2;
+    const drawY = y + (maxHeight - height) / 2;
+    doc.addImage(rasterized.dataUrl, 'PNG', drawX, drawY, width, height);
     return true;
-  } catch (err) {
-    console.error('Logo rendering failed:', err);
+  } catch (error) {
+    console.error('Logo rendering failed:', error);
     return false;
+  } finally {
+    cleanup();
   }
 }
 
@@ -392,78 +422,58 @@ export async function addStudentPhotoToPDF(
   y: number,
   size: number
 ): Promise<boolean> {
-  if (!photoUrl) return false;
+  if (!photoUrl?.trim()) return false;
+
+  let cleanup: () => void = () => undefined;
   try {
-    let dataUrl = photoUrl;
-    if (!photoUrl.startsWith('data:')) {
-      const fetchUrl = photoUrl.split('?')[0];
-      let blob: Blob | null = null;
+    const renderable = await getRenderableImage(photoUrl.trim());
+    cleanup = renderable.cleanup;
+    const image = renderable.image;
+    const sourceWidth = Math.max(1, image.naturalWidth || image.width);
+    const sourceHeight = Math.max(1, image.naturalHeight || image.height);
+    const sourceSize = Math.min(sourceWidth, sourceHeight);
+    const sourceX = (sourceWidth - sourceSize) / 2;
+    const sourceY = (sourceHeight - sourceSize) / 2;
 
-      // Attempt 1: fetch with CORS mode and cache-busting
-      try {
-        const resp = await fetch(`${fetchUrl}?t=${Date.now()}`, {
-          mode: 'cors',
-          headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' },
-        });
-        if (resp.ok) blob = await resp.blob();
-      } catch { /* fall through */ }
-
-      // Attempt 2: fetch without custom headers
-      if (!blob) {
-        try {
-          const resp = await fetch(fetchUrl, { mode: 'cors' });
-          if (resp.ok) blob = await resp.blob();
-        } catch { /* fall through */ }
-      }
-
-      // Attempt 3: no-cors mode as last resort
-      if (!blob) {
-        try {
-          const resp = await fetch(fetchUrl);
-          if (resp.ok) blob = await resp.blob();
-        } catch { /* fall through */ }
-      }
-
-      if (blob) {
-        dataUrl = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(reader.result as string);
-          reader.onerror = reject;
-          reader.readAsDataURL(blob!);
-        });
-      } else {
-        console.warn('Student photo fetch failed, skipping photo');
-        return false;
-      }
-    }
-    // Render to canvas for circular crop at high resolution
+    // Render at more than 2× the requested PDF size for a clear portrait.
+    const pixelSize = Math.max(256, Math.min(1024, Math.round(size * 3.78 * 2.5)));
     const canvas = document.createElement('canvas');
-    const px = Math.round(size * 3.78 * 2); // ~2x resolution for clarity
-    canvas.width = px;
-    canvas.height = px;
-    const ctx = canvas.getContext('2d')!;
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    await new Promise<void>((resolve, reject) => {
-      img.onload = () => resolve();
-      img.onerror = reject;
-      img.src = dataUrl;
-    });
-    // Circular clip
-    ctx.beginPath();
-    ctx.arc(px / 2, px / 2, px / 2, 0, Math.PI * 2);
-    ctx.closePath();
-    ctx.clip();
-    ctx.drawImage(img, 0, 0, px, px);
-    const circularDataUrl = canvas.toDataURL('image/png');
-    // Blue border circle
-    doc.setDrawColor(37, 99, 235);
-    doc.setLineWidth(0.8);
+    canvas.width = pixelSize;
+    canvas.height = pixelSize;
+    const context = canvas.getContext('2d');
+    if (!context) throw new Error('Canvas rendering is unavailable.');
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = 'high';
+    context.beginPath();
+    context.arc(pixelSize / 2, pixelSize / 2, pixelSize / 2, 0, Math.PI * 2);
+    context.closePath();
+    context.clip();
+    context.drawImage(
+      image,
+      sourceX,
+      sourceY,
+      sourceSize,
+      sourceSize,
+      0,
+      0,
+      pixelSize,
+      pixelSize,
+    );
+
+    doc.addImage(canvas.toDataURL('image/png'), 'PNG', x, y, size, size);
+    // A white outer ring keeps the portrait clear against the blue header.
+    doc.setDrawColor(255, 255, 255);
+    doc.setLineWidth(1.2);
     doc.circle(x + size / 2, y + size / 2, size / 2, 'S');
-    doc.addImage(circularDataUrl, 'PNG', x, y, size, size);
+    doc.setDrawColor(37, 99, 235);
+    doc.setLineWidth(0.25);
+    doc.circle(x + size / 2, y + size / 2, size / 2 - 0.7, 'S');
     return true;
-  } catch {
+  } catch (error) {
+    console.error('Student photo rendering failed:', error);
     return false;
+  } finally {
+    cleanup();
   }
 }
 
@@ -547,30 +557,39 @@ export async function drawReportHeader(
   schoolInfo: SchoolInfo,
   subtitle: string = 'STUDENT REPORT CARD'
 ) {
-  // Blue header background
+  // Professional three-part header: school logo left, identity centred, and
+  // the caller's student portrait in the reserved top-right area.
   doc.setFillColor(37, 99, 235);
-  doc.rect(0, 0, 210, 32, 'F');
+  doc.rect(0, 0, 210, 34, 'F');
 
-  // Try to add logo (left side, bigger)
-  const logoAdded = schoolInfo.logo_url
-    ? await addLogoToPDF(doc, schoolInfo.logo_url, 10, 3, 26, 26)
-    : false;
+  if (schoolInfo.logo_url) {
+    doc.setFillColor(255, 255, 255);
+    doc.roundedRect(8, 2, 29, 29, 2, 2, 'F');
+    await addLogoToPDF(doc, schoolInfo.logo_url, 9.5, 3.5, 26, 26);
+  }
 
+  const displayName = resolveSchoolName(schoolInfo.name);
   doc.setTextColor(255, 255, 255);
-  // School name — always prominent, never fall back to generic 'School'
-  const displayName = schoolInfo.name?.trim() || 'School';
-  doc.setFontSize(logoAdded ? 14 : 16);
   doc.setFont('helvetica', 'bold');
-  doc.text(displayName, logoAdded ? 40 : 105, logoAdded ? 11 : 11, { align: logoAdded ? 'left' : 'center' });
+
+  // Keep long multi-tenant school names centred between the two images.
+  let nameFontSize = 15;
+  doc.setFontSize(nameFontSize);
+  while (doc.getTextWidth(displayName) > 124 && nameFontSize > 10) {
+    nameFontSize -= 0.5;
+    doc.setFontSize(nameFontSize);
+  }
+  doc.text(displayName, 105, 11, { align: 'center' });
 
   doc.setFontSize(9);
   doc.setFont('helvetica', 'normal');
-  doc.text(subtitle, logoAdded ? 40 : 105, logoAdded ? 20 : 20, { align: logoAdded ? 'left' : 'center' });
+  doc.text(subtitle, 105, 20, { align: 'center' });
 
   if (schoolInfo.motto) {
     doc.setFontSize(6.5);
     doc.setFont('helvetica', 'italic');
-    doc.text(`"${schoolInfo.motto}"`, logoAdded ? 40 : 105, 27, { align: logoAdded ? 'left' : 'center' });
+    const motto = doc.splitTextToSize(`"${schoolInfo.motto}"`, 120)[0];
+    doc.text(motto, 105, 27, { align: 'center' });
   }
 }
 
@@ -583,7 +602,7 @@ export function drawStudentInfo(
   termName: string,
   academicYear: string,
   position: string,
-  y: number = 38
+  y: number = 40
 ) {
   doc.setTextColor(0, 0, 0);
   doc.setFontSize(9);

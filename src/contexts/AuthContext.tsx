@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
 import { supabase } from '@/lib/supabase/client';
 import type { UserRole, Profile } from '@/types/database';
+import { loadSchoolBranding } from '@/lib/schoolBranding';
 
 interface AuthUser {
   id: string;
@@ -47,37 +48,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const fetchSchoolData = async (schoolId: string) => {
     if (!schoolId) return;
-    console.log('[AuthContext] fetchSchoolData called with schoolId:', schoolId);
     try {
-      // Use type cast to avoid TypeScript errors with columns like motto
-      const { data, error } = await (supabase as any)
-        .from('schools')
-        .select('id, name, logo_url, address, phone, email, motto, principal_name, status, locked_reason')
-        .eq('id', schoolId)
-        .maybeSingle();
-
-      console.log('[AuthContext] school fetch result:', { data: data ? { id: data.id, name: data.name } : null, error });
-
-      if (error) {
+      // loadSchoolBranding retries with a core column set when an older schema
+      // is missing an optional field such as motto. The school name/logo must
+      // never disappear because one optional column is absent.
+      const { data, found, error } = await loadSchoolBranding(supabase as any, schoolId);
+      if (!found) {
         console.error('School fetch error:', error);
         return;
       }
 
-      if (data) {
-        console.log('[AuthContext] Setting schoolData:', data.name);
-        setSchoolData({
-          id: data.id,
-          name: data.name, // Always use the actual school name from the database
-          logo_url: data.logo_url || null,
-          address: data.address || null,
-          phone: data.phone || null,
-          email: data.email || null,
-          motto: data.motto || null,
-          principal_name: data.principal_name || null,
-          status: data.status || 'active',
-          locked_reason: data.locked_reason || null,
-        });
-      }
+      setSchoolData({
+        id: data.id || schoolId,
+        name: data.name,
+        logo_url: data.logo_url,
+        address: data.address || null,
+        phone: data.phone || null,
+        email: data.email || null,
+        motto: data.motto || null,
+        principal_name: data.principal_name || null,
+        status: data.status || 'active',
+        locked_reason: data.locked_reason || null,
+      });
     } catch (err) {
       console.error('fetchSchoolData error:', err);
     }

@@ -2,19 +2,20 @@ import { useState, useEffect, useRef } from 'react';
 import { supabaseUntyped } from "@/lib/supabase/client";
 import { supabase } from "@/lib/supabase/client";
 import { useAuth } from '@/contexts/AuthContext';
-import { Loader2, Save, Palette, School, Bell, Signature, Upload, Link, X, Image } from 'lucide-react';
+import { Loader2, Save, Palette, Bell, Signature, Upload, Link, X, Image } from 'lucide-react';
 import { toast } from 'sonner';
 import { subscribeToPush } from '@/hooks/usePWA';
 import DigitalSignature from '@/components/DigitalSignature';
+import { isMissingColumnError } from '@/lib/schoolBranding';
 
 export default function SchoolBranding() {
-  const { user } = useAuth();
+  const { user, refreshProfile } = useAuth();
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [notifLoading, setNotifLoading] = useState(false);
   const [notifEnabled, setNotifEnabled] = useState(false);
   const [activeTab, setActiveTab] = useState<'branding' | 'signatures'>('branding');
-  const [logoInputMode, setLogoInputMode] = useState<'url' | 'upload'>('url');
+  const [logoInputMode, setLogoInputMode] = useState<'url' | 'upload'>('upload');
   const [logoUploading, setLogoUploading] = useState(false);
   const logoFileRef = useRef<HTMLInputElement>(null);
   const [form, setForm] = useState({
@@ -34,7 +35,10 @@ export default function SchoolBranding() {
   const [teachers, setTeachers] = useState<any[]>([]);
   const [teacherSigs, setTeacherSigs] = useState<Record<string, { url: string | null; type: string | null }>>({});
 
-  useEffect(() => { fetchSchool(); checkNotifPermission(); }, []);
+  useEffect(() => {
+    if (user?.schoolId) fetchSchool();
+    checkNotifPermission();
+  }, [user?.schoolId]);
 
   const checkNotifPermission = () => {
     if ('Notification' in window) {
@@ -43,148 +47,184 @@ export default function SchoolBranding() {
   };
 
   const fetchSchool = async () => {
+    if (!user?.schoolId) {
+      setLoading(false);
+      return;
+    }
+
     setLoading(true);
-    let data: any = null;
     try {
-      const { data: schoolData, error } = await supabaseUntyped
+      let { data, error } = await supabaseUntyped
         .from('schools')
         .select('id, name, motto, primary_color, secondary_color, logo_url, address, phone, email, website, principal_name, principal_signature_url, principal_signature_type')
-        .eq('id', user?.schoolId)
+        .eq('id', user.schoolId)
         .single();
-      if (error) throw error;
-      data = schoolData;
-    } catch (err: any) {
-      // If motto column doesn't exist, fetch without it
-      if (err.message?.includes('motto')) {
-        const { data: schoolData } = await supabaseUntyped
+
+      // Supabase query errors are returned in `error`; they are not thrown.
+      // Explicitly retrying here fixes the old schema-cache failure path.
+      if (error && isMissingColumnError(error, 'motto')) {
+        const fallback = await supabaseUntyped
           .from('schools')
           .select('id, name, primary_color, secondary_color, logo_url, address, phone, email, website, principal_name, principal_signature_url, principal_signature_type')
-          .eq('id', user?.schoolId)
+          .eq('id', user.schoolId)
           .single();
-        data = schoolData;
+        data = fallback.data;
+        error = fallback.error;
       }
+      if (error) throw error;
+
+      if (data) {
+        setForm({
+          name: data.name || '',
+          motto: data.motto || '',
+          primary_color: data.primary_color || '#2563EB',
+          secondary_color: data.secondary_color || '#1d4ed8',
+          logo_url: data.logo_url || '',
+          address: data.address || '',
+          phone: data.phone || '',
+          email: data.email || '',
+          website: data.website || '',
+          principal_name: data.principal_name || '',
+        });
+        setPrincipalSig({
+          url: data.principal_signature_url || null,
+          type: data.principal_signature_type || null,
+        });
+      }
+
+      const { data: teachersData, error: teachersError } = await supabaseUntyped
+        .from('teachers')
+        .select('id, first_name, last_name, signature_url, signature_type')
+        .eq('school_id', user.schoolId)
+        .eq('is_active', true)
+        .order('first_name');
+      if (teachersError) throw teachersError;
+      if (teachersData) {
+        setTeachers(teachersData);
+        const sigs: Record<string, { url: string | null; type: string | null }> = {};
+        teachersData.forEach((t: any) => {
+          sigs[t.id] = { url: t.signature_url || null, type: t.signature_type || null };
+        });
+        setTeacherSigs(sigs);
+      }
+    } catch (err: any) {
+      toast.error('Failed to load school branding: ' + (err.message || 'Unknown error'));
+    } finally {
+      setLoading(false);
     }
-    if (data) {
-      setForm({
-        name: data.name || '',
-        motto: data.motto || '',
-        primary_color: data.primary_color || '#2563EB',
-        secondary_color: data.secondary_color || '#1d4ed8',
-        logo_url: data.logo_url || '',
-        address: data.address || '',
-        phone: data.phone || '',
-        email: data.email || '',
-        website: data.website || '',
-        principal_name: data.principal_name || '',
-      });
-      setPrincipalSig({
-        url: data.principal_signature_url || null,
-        type: data.principal_signature_type || null,
-      });
-    }
-    // Fetch teachers with signatures
-    const { data: teachersData } = await supabaseUntyped
-      .from('teachers')
-      .select('id, first_name, last_name, signature_url, signature_type')
-      .eq('school_id', user?.schoolId)
-      .eq('is_active', true)
-      .order('first_name');
-    if (teachersData) {
-      setTeachers(teachersData);
-      const sigs: Record<string, { url: string | null; type: string | null }> = {};
-      teachersData.forEach((t: any) => {
-        sigs[t.id] = { url: t.signature_url || null, type: t.signature_type || null };
-      });
-      setTeacherSigs(sigs);
-    }
-    setLoading(false);
   };
 
   const handleLogoFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    if (file.size > 5 * 1024 * 1024) { toast.error('File too large. Max 5MB.'); return; }
-    const allowedTypes = ['image/png', 'image/jpeg', 'image/jpg', 'image/svg+xml', 'image/webp'];
-    if (!allowedTypes.includes(file.type)) { toast.error('Only PNG, JPG, SVG, WEBP files are allowed.'); return; }
+
+    const resetFileInput = () => {
+      e.target.value = '';
+      if (logoFileRef.current) logoFileRef.current.value = '';
+    };
+
+    if (!user?.schoolId) {
+      toast.error('Your account is not linked to a school.');
+      resetFileInput();
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      toast.error('File too large. Max 5MB.');
+      resetFileInput();
+      return;
+    }
+
+    const extensionByMime: Record<string, string> = {
+      'image/png': 'png',
+      'image/jpeg': 'jpg',
+      'image/jpg': 'jpg',
+      'image/svg+xml': 'svg',
+      'image/webp': 'webp',
+    };
+    const extension = extensionByMime[file.type];
+    if (!extension) {
+      toast.error('Only PNG, JPG, SVG, and WEBP files are allowed.');
+      resetFileInput();
+      return;
+    }
 
     setLogoUploading(true);
     try {
-      const ext = file.name.split('.').pop() || 'png';
-      const path = `logos/${user?.schoolId}.${ext}`;
+      // Derive the extension from the verified MIME type rather than trusting
+      // the original filename. The stable path keeps each school's files
+      // isolated and allows safe upserts.
+      const path = `logos/${user.schoolId}.${extension}`;
       const { error: uploadError } = await supabase.storage
         .from('school-logos')
-        .upload(path, file, { upsert: true, contentType: file.type });
-      if (uploadError) throw new Error(uploadError.message);
+        .upload(path, file, { upsert: true, contentType: file.type, cacheControl: '3600' });
+      if (uploadError) throw uploadError;
 
       const { data: urlData } = supabase.storage.from('school-logos').getPublicUrl(path);
-      const publicUrl = urlData.publicUrl + `?t=${Date.now()}`;
+      const publicUrl = `${urlData.publicUrl}?v=${Date.now()}`;
 
-      // Save to DB immediately
+      // Save only logo_url here. This deliberately does not include motto, so
+      // a stale optional-column cache can never break a successful file upload.
       const { error: dbError } = await supabaseUntyped
         .from('schools')
         .update({ logo_url: publicUrl })
-        .eq('id', user?.schoolId);
-      if (dbError) throw new Error(dbError.message);
+        .eq('id', user.schoolId);
+      if (dbError) throw dbError;
 
       setForm(prev => ({ ...prev, logo_url: publicUrl }));
+      await refreshProfile();
       toast.success('School logo uploaded and saved!');
     } catch (err: any) {
-      toast.error('Logo upload failed: ' + err.message);
+      toast.error('Logo upload failed: ' + (err.message || 'Unknown error'));
     } finally {
       setLogoUploading(false);
-      if (logoFileRef.current) logoFileRef.current.value = '';
+      resetFileInput();
     }
   };
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!user?.schoolId) {
+      toast.error('Your account is not linked to a school.');
+      return;
+    }
+
     setSaving(true);
     try {
-      // Try to save with motto first, fallback without motto if column doesn't exist
-      let error: any = null;
-      try {
-        const result = await supabaseUntyped
+      const corePayload = {
+        primary_color: form.primary_color,
+        secondary_color: form.secondary_color,
+        logo_url: form.logo_url.trim() || null,
+        address: form.address,
+        phone: form.phone,
+        email: form.email,
+        website: form.website,
+        principal_name: form.principal_name,
+      };
+
+      let { error } = await supabaseUntyped
+        .from('schools')
+        .update({ ...corePayload, motto: form.motto })
+        .eq('id', user.schoolId);
+
+      // Supabase returns PostgREST errors instead of throwing them. The old
+      // nested try/catch therefore never ran; inspect the returned error and
+      // retry the core branding payload explicitly.
+      if (error && isMissingColumnError(error, 'motto')) {
+        const fallback = await supabaseUntyped
           .from('schools')
-          .update({
-            motto: form.motto,
-            primary_color: form.primary_color,
-            secondary_color: form.secondary_color,
-            logo_url: form.logo_url,
-            address: form.address,
-            phone: form.phone,
-            email: form.email,
-            website: form.website,
-            principal_name: form.principal_name,
-          })
-          .eq('id', user?.schoolId);
-        error = result.error;
-      } catch (err: any) {
-        if (err.message?.includes('motto') || err.message?.includes('schema cache')) {
-          // Retry without motto
-          const result = await supabaseUntyped
-            .from('schools')
-            .update({
-              primary_color: form.primary_color,
-              secondary_color: form.secondary_color,
-              logo_url: form.logo_url,
-              address: form.address,
-              phone: form.phone,
-              email: form.email,
-              website: form.website,
-              principal_name: form.principal_name,
-            })
-            .eq('id', user?.schoolId);
-          error = result.error;
-        } else {
-          throw err;
-        }
+          .update(corePayload)
+          .eq('id', user.schoolId);
+        error = fallback.error;
       }
+
       if (error) throw error;
+      await refreshProfile();
       toast.success('School branding saved!');
     } catch (err: any) {
-      toast.error('Failed to save: ' + err.message);
+      toast.error('Failed to save: ' + (err.message || 'Unknown error'));
+    } finally {
+      setSaving(false);
     }
-    setSaving(false);
   };
 
   const savePrincipalSignature = async (signatureUrl: string, signatureType: 'drawn' | 'uploaded') => {

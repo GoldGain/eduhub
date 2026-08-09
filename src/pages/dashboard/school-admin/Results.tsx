@@ -21,6 +21,7 @@ import {
   type SchoolInfo,
   type SignatureInfo,
 } from '@/lib/reportCardPdf';
+import { loadSchoolBranding, resolveSchoolName } from '@/lib/schoolBranding';
 
 function calculateCBEGrade(pct: number, classData?: { curriculum?: string | null; grade_level?: number | string | null; level?: number | string | null; name?: string | null }) {
   const band = getSchoolLevelBand(classData);
@@ -55,7 +56,7 @@ function shortName(name: string) {
 }
 
 export default function SchoolAdminResults() {
-  const { user } = useAuth();
+  const { user, schoolData } = useAuth();
   const [results, setResults] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
@@ -76,7 +77,7 @@ export default function SchoolAdminResults() {
   // Delete state
   const [deletingResult, setDeletingResult] = useState<any | null>(null);
   const [deletingResultLoading, setDeletingResultLoading] = useState(false);
-  const [schoolName, setSchoolName] = useState('School');
+  const [schoolName, setSchoolName] = useState('');
   const [bestPerSubjectList, setBestPerSubjectList] = useState<BestInSubject[]>([]);
   const [schoolInfo, setSchoolInfo] = useState<SchoolInfo>({ name: '' });
   const [principalSignatureUrl, setPrincipalSignatureUrl] = useState<string | null>(null);
@@ -91,47 +92,40 @@ export default function SchoolAdminResults() {
   const fetchAll = async () => {
     setLoading(true);
     const schoolId = user?.schoolId ?? '';
-    let sch: any = null;
+    if (!schoolId) {
+      setLoading(false);
+      return;
+    }
+
     try {
-      const results = await Promise.all([
+      const [resultsResponse, classesResponse, termsResponse, brandingResponse] = await Promise.all([
         supabaseUntyped.from('results').select('*, students(first_name, last_name, admission_number), subjects(name), classes(curriculum, grade_level, level, name)').eq('school_id', schoolId).order('created_at', { ascending: false }),
         supabaseUntyped.from('classes').select('*').eq('school_id', schoolId).order('level'),
         supabaseUntyped.from('terms').select('*').eq('school_id', schoolId).order('academic_year', { ascending: false }),
-        supabaseUntyped.from('schools').select('name, motto, logo_url, principal_name, principal_signature_url, address, phone, email').eq('id', schoolId).maybeSingle(),
+        loadSchoolBranding(supabaseUntyped, schoolId, resolveSchoolName(schoolData?.name)),
       ]);
-      setResults((results[0].data as any[]) || []);
-      setClasses((results[1].data as any[]) || []);
-      setTerms((results[2].data as any[]) || []);
-      sch = results[3].data;
-    } catch (err: any) {
-      // If motto column doesn't exist, fetch without it
-      if (err.message?.includes('motto')) {
-        const results = await Promise.all([
-          supabaseUntyped.from('results').select('*, students(first_name, last_name, admission_number), subjects(name), classes(curriculum, grade_level, level, name)').eq('school_id', schoolId).order('created_at', { ascending: false }),
-          supabaseUntyped.from('classes').select('*').eq('school_id', schoolId).order('level'),
-          supabaseUntyped.from('terms').select('*').eq('school_id', schoolId).order('academic_year', { ascending: false }),
-          supabaseUntyped.from('schools').select('name, logo_url, principal_name, principal_signature_url, address, phone, email').eq('id', schoolId).maybeSingle(),
-        ]);
-        setResults((results[0].data as any[]) || []);
-        setClasses((results[1].data as any[]) || []);
-        setTerms((results[2].data as any[]) || []);
-        sch = results[3].data;
+
+      if (resultsResponse.error) throw resultsResponse.error;
+      if (classesResponse.error) throw classesResponse.error;
+      if (termsResponse.error) throw termsResponse.error;
+
+      setResults((resultsResponse.data as any[]) || []);
+      setClasses((classesResponse.data as any[]) || []);
+      setTerms((termsResponse.data as any[]) || []);
+
+      if (!brandingResponse.found) {
+        console.error('Unable to load complete school branding:', brandingResponse.error);
       }
+      const branding = brandingResponse.data;
+      setSchoolName(branding.name);
+      setSchoolInfo(branding);
+      setPrincipalSignatureUrl(branding.principal_signature_url);
+    } catch (err: any) {
+      console.error('Failed to load results page:', err);
+      toast.error('Failed to load results: ' + (err.message || 'Unknown error'));
+    } finally {
+      setLoading(false);
     }
-    if (sch) {
-      setSchoolName(sch.name?.trim() || 'School');
-      setSchoolInfo({
-        name: sch.name?.trim() || 'School',
-        motto: sch.motto || '',
-        logo_url: sch.logo_url || null,
-        principal_name: sch.principal_name || '',
-        address: sch.address || '',
-        phone: sch.phone || '',
-        email: sch.email || '',
-      });
-      setPrincipalSignatureUrl(sch.principal_signature_url || null);
-    }
-    setLoading(false);
   };
 
   const filtered = results.filter(r =>
@@ -382,7 +376,7 @@ export default function SchoolAdminResults() {
       const bestPerSubjectData = computeBestPerSubject(rawResults, classObj);
       const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
       // Use schoolInfo.name (fetched from DB) for all pages
-      const displaySchoolName = schoolInfo.name || schoolName || 'School';
+      const displaySchoolName = resolveSchoolName(schoolInfo.name, schoolName || schoolData?.name || undefined);
 
       // ── PAGE 1: CLASS SUMMARY ────────────────────────────────────────────────────
       {
@@ -771,9 +765,9 @@ export default function SchoolAdminResults() {
         // Header — use shared drawReportHeader for logo + school name consistency
         await drawReportHeader(doc, schoolInfo);
 
-        // Student photo (top-right, 30x30mm) — consistent with student/parent portals
+        // Student portrait in the top-right header (27mm ≈ 102px at 96 DPI).
         if (s.student?.photo_url) {
-          try { await addStudentPhotoToPDF(doc, s.student.photo_url, 168, 33, 30); } catch {}
+          try { await addStudentPhotoToPDF(doc, s.student.photo_url, 173, 2.5, 27); } catch {}
         }
 
         // Student info
